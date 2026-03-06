@@ -1,0 +1,88 @@
+import os, json, time, math, uuid, hashlib, socket, redis
+from tree_sitter_engine import TargetedTreeSitterPatcher
+from smt_oracle import Z3EquivalenceChecker
+from fault_localization import FaultLocalizer
+
+REDIS_HOST = os.getenv("OMEGA_REDIS_HOST", "localhost")
+STREAM_PENDING = "omega:stream:capsules"
+
+class ForestWorker:
+    def __init__(self, tree_id: str):
+        self.worker_id = f"worker_{uuid.uuid4().hex[:8]}"
+        self.tree_id = tree_id
+        self.r = redis.Redis(host=REDIS_HOST, port=6379, decode_responses=True)
+        self.patcher = TargetedTreeSitterPatcher()
+        self.smt_oracle = Z3EquivalenceChecker()
+        print(f"[Worker {self.worker_id}] Assigned to {tree_id}")
+
+    def distributed_select(self) -> str:
+        current = f"omega:tree:{self.tree_id}:root"
+        while True:
+            children = self.r.smembers(f"{current}:children")
+            if not children: return current
+            best_node, best_ucb = None, -float('inf')
+            p_visits = int(self.r.hget(current, "visits") or 1)
+            for c_id in children:
+                c_data = self.r.hgetall(c_id)
+                v = int(c_data.get("visits", 0))
+                if v == 0: return c_id
+                ucb = (float(c_data.get("value_sum", 0)) / v) + 1.414 * math.sqrt(math.log(p_visits) / v)
+                if ucb > best_ucb: best_ucb, best_node = ucb, c_id
+            current = best_node
+
+    def dispatch_to_rust(self, capsule: dict):
+        core_id = int(hashlib.md5(capsule["id"].encode()).hexdigest(), 16) % 4
+        try:
+            with socket.create_connection(("127.0.0.1", 8000 + core_id), timeout=5) as s:
+                s.sendall(json.dumps(capsule).encode('utf-8'))
+                s.shutdown(socket.SHUT_WR)
+        except: pass
+
+    def expand(self, node_id: str):
+        data = self.r.hgetall(node_id)
+        if not data or data.get("is_terminal") == "True": return
+        
+        orig_code = data["code"]
+        test_code = data.get("test_code", "def test_algo(): assert True")
+        
+        # Mock Ochiai Coverage (Prod replaces with Stage 2 execution hooks)
+        mock_cov = {3: {"failed": 10, "passed": 0}, 4: {"failed": 10, "passed": 0}} 
+        suspicious_lines = FaultLocalizer(10, 0).get_top_k_lines(mock_cov, k=2)
+
+        raw_candidates = self.patcher.generate_targeted_patches(orig_code, suspicious_lines)
+        if not raw_candidates:
+            self.r.hset(node_id, "is_terminal", "True")
+            return
+
+        pipe = self.r.pipeline()
+        for cand_code in raw_candidates:
+            # Stage 1.5: SMT Energy Pre-Filter
+            if self.smt_oracle.is_semantically_equivalent(orig_code, cand_code):
+                continue # Skip mathematically identical patches
+                
+            child_id = f"omega:tree:{self.tree_id}:" + hashlib.sha256((cand_code + node_id).encode()).hexdigest()
+            pipe.hset(child_id, mapping={"code": cand_code, "parent": node_id, "visits": 0, "value_sum": 0.0})
+            pipe.sadd(f"{node_id}:children", child_id)
+            
+            # Dispatch directly. Result will be handled by Global Memory via Streams.
+            self.dispatch_to_rust({
+                "id": child_id, 
+                "code": cand_code,
+                "test_code": test_code
+            })
+        pipe.execute()
+
+    def run(self):
+        while True:
+            node_id = self.distributed_select()
+            lock_key = f"omega:lock:{node_id}"
+            if self.r.set(lock_key, self.worker_id, nx=True, ex=10):
+                try: self.expand(node_id)
+                finally:
+                    if self.r.get(lock_key) == self.worker_id: self.r.delete(lock_key)
+            else: time.sleep(0.1)
+
+if __name__ == "__main__":
+    ForestWorker("task_alpha").run()
+
+

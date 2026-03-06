@@ -1,0 +1,30 @@
+[repo]
+language = "python"
+package_manager = "pip"
+
+[omega]
+redis = "redis://127.0.0.1:6379"
+cas_endpoint = "http://127.0.0.1:9000"
+cas_bucket = "omega-cas"
+cas_access_key = "minioadmin"
+cas_secret_key = "minioadmin"
+executor_host = "127.0.0.1"
+executor_base_port = 18000
+executor_cores = 4
+telemetry_host = "127.0.0.1"
+telemetry_port = 8787
+worker_heartbeat_ttl_seconds = 10
+
+[budgets]
+max_capsules = 200
+max_wall_seconds = 600
+max_diff_lines = 10
+max_touched_files = 1
+max_depth = 6
+max_children = 4
+suspicious_line_count = 5
+
+[policy]
+deny_edit_tests = true
+deny_disable_asserts = true
+require_hardware_isolation = true

@@ -1,0 +1,52 @@
+use std::io::{Read, Write};
+use std::process::Command;
+use vsock::{VsockAddr, VsockListener, VMADDR_CID_ANY};
+use serde::{Deserialize, Serialize};
+
+#[derive(Deserialize)]
+struct Payload {
+    code: String,
+    test_code: String,
+}
+
+#[derive(Serialize)]
+struct FunnelResult {
+    success: bool,
+    tests_failed: u32,
+    error: Option<String>,
+    runtime: f64,
+}
+
+fn main() {
+    let listener = VsockListener::bind(&VsockAddr::new(VMADDR_CID_ANY, 52))
+        .expect("Failed to bind VSOCK");
+
+    for stream in listener.incoming() {
+        if let Ok(mut s) = stream {
+            let mut buf = vec![0; 1024 * 1024]; // 1MB buffer
+            if let Ok(n) = s.read(&mut buf) {
+                if let Ok(payload) = serde_json::from_slice::<Payload>(&buf[..n]) {
+                    
+                    // Write the candidate patch and test to the ephemeral RAM disk
+                    std::fs::write("/tmp/algo.py", &payload.code).unwrap_or(());
+                    std::fs::write("/tmp/test_algo.py", &payload.test_code).unwrap_or(());
+
+                    // Execute the Python Verification Funnel securely
+                    let output = Command::new("python3")
+                        .arg("/sbin/funnel.py")
+                        .arg("/tmp/algo.py")
+                        .arg("/tmp/test_algo.py")
+                        .output();
+
+                    if let Ok(out) = output {
+                        let _ = s.write_all(&out.stdout); // Funnel prints JSON directly
+                    }
+                }
+            }
+        }
+        break; // Single-shot VM contract
+    }
+    unsafe { libc::reboot(libc::LINUX_REBOOT_CMD_POWER_OFF); }
+}
+
+

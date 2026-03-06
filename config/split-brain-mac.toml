@@ -1,0 +1,7 @@
+[policy]
+require_hardware_isolation = true
+
+[omega]
+telemetry_host = "127.0.0.1"
+telemetry_port = 8787
+

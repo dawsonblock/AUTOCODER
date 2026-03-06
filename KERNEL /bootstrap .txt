@@ -1,0 +1,68 @@
+#!/bin/bash
+set -e
+
+echo ">>> BOOTSTRAPPING KERNEL Ω V19 INFRASTRUCTURE <<<"
+
+# 1. OS Limits for io_uring
+echo "[*] Unlocking memlock for io_uring..."
+sudo prlimit --memlock=unlimited --pid $$
+if ! grep -q "memlock" /etc/security/limits.conf; then
+    sudo tee -a /etc/security/limits.conf <<EOF
+* hard    memlock    unlimited
+* soft    memlock    unlimited
+EOF
+fi
+
+# 2. Btrfs Loopback for FICLONE zero-copy
+mkdir -p /tmp/omega/assets /tmp/omega/vms /tmp/omega/mnt
+if ! df -T /tmp/omega | grep -q -e "btrfs" -e "xfs"; then
+    echo "[*] Creating Btrfs loopback..."
+    dd if=/dev/zero of=/tmp/omega_storage.img bs=1M count=4096 status=none
+    mkfs.btrfs -q /tmp/omega_storage.img
+    sudo mount -o loop,compress=zstd /tmp/omega_storage.img /tmp/omega
+    sudo chown -R $USER:$USER /tmp/omega
+    mkdir -p /tmp/omega/assets /tmp/omega/vms /tmp/omega/mnt
+fi
+
+# 3. Compile Guest Agent
+echo "[*] Compiling Rust Guest Agent..."
+cd guest_agent
+rustup target add x86_64-unknown-linux-musl
+cargo build --release --target x86_64-unknown-linux-musl
+cd ..
+
+# 4. Provision Alpine RootFS + Inject Agent & Funnel
+echo "[*] Generating 150MB ext4 Template Image..."
+dd if=/dev/zero of=/tmp/omega/assets/rootfs.ext4 bs=1M count=150 status=none
+mkfs.ext4 -q /tmp/omega/assets/rootfs.ext4
+
+wget -q https://dl-cdn.alpinelinux.org/alpine/v3.18/releases/x86_64/alpine-minirootfs-3.18.4-x86_64.tar.gz -O /tmp/alpine.tar.gz
+sudo mount /tmp/omega/assets/rootfs.ext4 /tmp/omega/mnt
+sudo tar -xf /tmp/alpine.tar.gz -C /tmp/omega/mnt
+
+# Ensure DNS works inside chroot for APK
+sudo cp /etc/resolv.conf /tmp/omega/mnt/etc/resolv.conf
+echo "[*] Installing Python Toolchain in MicroVM RootFS..."
+sudo chroot /tmp/omega/mnt /sbin/apk update
+sudo chroot /tmp/omega/mnt /sbin/apk add --no-cache python3 py3-pip py3-pytest py3-mypy ruff
+
+# Inject Agent and Funnel
+sudo cp guest_agent/target/x86_64-unknown-linux-musl/release/guest_agent /tmp/omega/mnt/sbin/init
+sudo cp guest_agent/funnel.py /tmp/omega/mnt/sbin/funnel.py
+sudo chmod +x /tmp/omega/mnt/sbin/init /tmp/omega/mnt/sbin/funnel.py
+sudo umount /tmp/omega/mnt
+
+# 5. Firecracker & Kernel
+echo "[*] Downloading Firecracker Guest Kernel..."
+wget -q https://s3.amazonaws.com/spec.ccfc.min/img/quickstart_guide/x86_64/kernels/vmlinux.bin -O /tmp/omega/assets/vmlinux.bin
+
+FC_VERSION="v1.10.1"
+wget -q "https://github.com/firecracker-microvm/firecracker/releases/download/${FC_VERSION}/firecracker-${FC_VERSION}-x86_64.tgz"
+tar -xzf firecracker-${FC_VERSION}-x86_64.tgz
+sudo mv release-${FC_VERSION}-x86_64/firecracker-${FC_VERSION}-x86_64 /usr/local/bin/firecracker
+sudo chmod +x /usr/local/bin/firecracker
+rm -rf release-${FC_VERSION}-x86_64 firecracker-${FC_VERSION}-x86_64.tgz /tmp/alpine.tar.gz
+
+echo ">>> BOOTSTRAP COMPLETE <<<"
+
+

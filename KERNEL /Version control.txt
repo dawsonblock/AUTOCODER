@@ -1,0 +1,51 @@
+import os, json, redis, subprocess
+
+REDIS_HOST = os.getenv("OMEGA_REDIS_HOST", "localhost")
+STREAM_ACCEPTED = "omega:stream:accepted"
+TARGET_REPO = os.getenv("OMEGA_REPO_PATH", "/tmp/omega_repo")
+TARGET_FILE = os.getenv("OMEGA_TARGET_FILE", "src/algo.py")
+
+class MergerService:
+    def __init__(self):
+        self.r = redis.Redis(host=REDIS_HOST, port=6379, decode_responses=True)
+        try: self.r.xgroup_create(STREAM_ACCEPTED, "merger_group", id="0", mkstream=True)
+        except: pass
+        print("[Merger] ⚙️ Online. Awaiting Git merge approvals.")
+        
+        # Ensure dummy repo exists for demonstration if configured path doesn't
+        if not os.path.exists(TARGET_REPO):
+            os.makedirs(TARGET_REPO, exist_ok=True)
+            subprocess.run(["git", "init"], cwd=TARGET_REPO, check=True, capture_output=True)
+
+    def apply_patch(self, capsule_id: str, code: str):
+        branch = f"omega_repair_{capsule_id[:8]}"
+        file_path = os.path.join(TARGET_REPO, TARGET_FILE)
+        os.makedirs(os.path.dirname(file_path), exist_ok=True)
+        try:
+            subprocess.run(["git", "checkout", "-b", branch], cwd=TARGET_REPO, check=True, capture_output=True)
+            with open(file_path, "w") as f: f.write(code)
+            subprocess.run(["git", "add", "."], cwd=TARGET_REPO, check=True, capture_output=True)
+            subprocess.run(["git", "commit", "-am", f"Kernel Ω repair for {capsule_id}"], cwd=TARGET_REPO, check=True, capture_output=True)
+            print(f"[Merger] 🚀 Committed to branch: {branch}")
+            subprocess.run(["git", "checkout", "-"], cwd=TARGET_REPO, check=True, capture_output=True)
+        except subprocess.CalledProcessError as e:
+            print(f"[Merger] ❌ Git Failed: {e.stderr.decode('utf-8', errors='ignore')}")
+            subprocess.run(["git", "checkout", "--", "."], cwd=TARGET_REPO, capture_output=True)
+            subprocess.run(["git", "checkout", "-"], cwd=TARGET_REPO, capture_output=True)
+
+    def run(self):
+        while True:
+            entries = self.r.xreadgroup("merger_group", "merger_1", {STREAM_ACCEPTED: ">"}, count=10, block=5000)
+            if entries:
+                pipe = self.r.pipeline()
+                for stream, msgs in entries:
+                    for mid, msg in msgs:
+                        pack = json.loads(msg["payload"])
+                        self.apply_patch(pack["capsule_id"], pack["code"])
+                        pipe.xack(STREAM_ACCEPTED, "merger_group", mid)
+                pipe.execute()
+
+if __name__ == "__main__":
+    MergerService().run()
+
+

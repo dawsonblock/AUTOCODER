@@ -1,0 +1,26 @@
+#!/bin/bash
+set -e
+
+echo "[*] Booting template Firecracker instance for Snapshot creation..."
+rm -f /tmp/fc_golden.sock
+firecracker --api-sock /tmp/fc_golden.sock &
+FC_PID=$!
+
+sleep 1
+
+curl -X PUT --unix-socket /tmp/fc_golden.sock http://localhost/machine-config -d '{"vcpu_count": 1, "mem_size_mib": 256}'
+curl -X PUT --unix-socket /tmp/fc_golden.sock http://localhost/boot-source -d '{"kernel_image_path": "/tmp/omega/assets/vmlinux.bin", "boot_args": "console=ttyS0 reboot=k panic=1 pci=off init=/sbin/init"}'
+curl -X PUT --unix-socket /tmp/fc_golden.sock http://localhost/drives/rootfs -d '{"drive_id": "rootfs", "path_on_host": "/tmp/omega/assets/rootfs.ext4", "is_root_device": true, "is_read_only": false}'
+curl -X PUT --unix-socket /tmp/fc_golden.sock http://localhost/actions -d '{"action_type": "InstanceStart"}'
+
+echo "[*] Waiting 2 seconds for Kernel to boot and /sbin/init to stabilize..."
+sleep 2
+
+echo "[*] Pausing MicroVM and Capturing Snapshot..."
+curl -X PUT --unix-socket /tmp/fc_golden.sock http://localhost/actions -d '{"action_type": "Pause"}'
+curl -X PUT --unix-socket /tmp/fc_golden.sock http://localhost/snapshot/create -d '{"snapshot_type": "Full", "snapshot_path": "/tmp/omega/assets/vm.snap", "mem_file_path": "/tmp/omega/assets/vm.mem"}'
+
+kill $FC_PID && wait $FC_PID || true
+echo "[✓] Golden Snapshot created. Sub-15ms VM boots enabled."
+
+

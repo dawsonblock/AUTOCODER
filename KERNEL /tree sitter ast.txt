@@ -1,0 +1,43 @@
+import tree_sitter
+import tree_sitter_python as tspython
+from typing import List, Set
+
+class TargetedTreeSitterPatcher:
+    def __init__(self):
+        # Compatible with modern Tree-sitter v0.22+
+        self.language = tree_sitter.Language(tspython.language())
+        self.parser = tree_sitter.Parser(self.language)
+        self.comparison_query = self.language.query("""
+            (comparison_operator operators: (_) @op)
+        """)
+
+    def _replace_bytes(self, source_bytes: bytes, start_byte: int, end_byte: int, new_content: bytes) -> bytes:
+        return source_bytes[:start_byte] + new_content + source_bytes[end_byte:]
+
+    def generate_targeted_patches(self, code: str, suspicious_lines: List[int]) -> List[str]:
+        source_bytes = code.encode('utf-8')
+        tree = self.parser.parse(source_bytes)
+        candidates: Set[str] = set()
+        
+        captures = self.comparison_query.captures(tree.root_node)
+        for node, _ in captures:
+            node_line = node.start_point[0] + 1
+            if node_line not in suspicious_lines:
+                continue
+                
+            op_text = source_bytes[node.start_byte:node.end_byte].decode('utf-8')
+            swaps = []
+            if op_text == '<': swaps.append('<=')
+            elif op_text == '<=': swaps.append('<')
+            elif op_text == '>': swaps.append('>=')
+            elif op_text == '>=': swaps.append('>')
+            elif op_text == '==': swaps.append('!=')
+            elif op_text == '!=': swaps.append('==')
+            
+            for new_op in swaps:
+                patched_bytes = self._replace_bytes(source_bytes, node.start_byte, node.end_byte, new_op.encode('utf-8'))
+                candidates.add(patched_bytes.decode('utf-8'))
+                
+        return list(candidates)
+
+

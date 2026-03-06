@@ -1,0 +1,41 @@
+#!/usr/bin/env bpftrace
+#include <linux/fs.h>
+
+BEGIN
+{
+  printf(">>> KERNEL OMEGA V19 eBPF X-RAY ONLINE <<<\n");
+  @ficlone_cmd = 0x40049409;
+}
+
+tracepoint:syscalls:sys_enter_io_uring_enter /comm == "omega_hyperviso"/
+{
+  @io_uring_start[tid] = nsecs;
+}
+
+tracepoint:syscalls:sys_exit_io_uring_enter /@io_uring_start[tid]/
+{
+  @io_uring_latency_ns = hist(nsecs - @io_uring_start[tid]);
+  delete(@io_uring_start[tid]);
+}
+
+tracepoint:syscalls:sys_enter_ioctl /comm == "omega_hyperviso" && args->cmd == @ficlone_cmd/
+{
+  @ficlone_start[tid] = nsecs;
+}
+
+tracepoint:syscalls:sys_exit_ioctl /@ficlone_start[tid]/
+{
+  @vm_clone_latency_us = hist((nsecs - @ficlone_start[tid]) / 1000);
+  delete(@ficlone_start[tid]);
+}
+
+tracepoint:kvm:kvm_exit
+{
+  @kvm_exits_by_reason[args->exit_reason] = count();
+}
+
+END
+{
+  printf("\n--- DUMP ---\n");
+  clear(@ficlone_cmd);
+}

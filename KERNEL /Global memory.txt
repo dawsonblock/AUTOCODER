@@ -1,0 +1,55 @@
+import os, json, redis
+
+REDIS_HOST = os.getenv("OMEGA_REDIS_HOST", "localhost")
+STREAM_RESULTS = "omega:stream:results"
+
+class GlobalMemory:
+    def __init__(self):
+        self.r = redis.Redis(host=REDIS_HOST, port=6379, decode_responses=True)
+        try: self.r.xgroup_create(STREAM_RESULTS, "memory_group", id="0", mkstream=True)
+        except: pass
+        print("[Global Memory] 🧠 Online. MCTS Backpropagation Engine running.")
+
+    def compute_reward(self, pack: dict, parent_data: dict) -> float:
+        tf = pack.get("tests_failed", 1)
+        pf = int(parent_data.get("tests_failed", 999)) if parent_data else 999
+        reward = (100 * pack.get("tests_passed", 0)) - (200 * tf) - (0.01 * pack.get("runtime", 0.0))
+        if tf < pf: reward += 500 * (pf - tf)
+        return reward
+
+    def run(self):
+        while True:
+            entries = self.r.xreadgroup("memory_group", "mem_1", {STREAM_RESULTS: ">"}, count=50, block=2000)
+            if entries:
+                pipe = self.r.pipeline()
+                for stream, msgs in entries:
+                    for mid, msg in msgs:
+                        try:
+                            pack = json.loads(msg["payload"])
+                            node_id = pack["capsule_id"]
+                            node_data = self.r.hgetall(node_id)
+                            if not node_data: continue
+                            
+                            parent_id = node_data.get("parent")
+                            p_data = self.r.hgetall(parent_id) if parent_id else None
+                            reward = self.compute_reward(pack, p_data)
+                            
+                            if pack.get("success") and pack.get("tests_failed", 1) == 0:
+                                print(f"\n🏆 FORMAL PROOF DISCOVERED: {node_id[-8:]}")
+                                self.r.hset(node_id, "is_terminal", "True")
+                            
+                            curr = node_id
+                            while curr:
+                                pipe.hincrby(curr, "visits", 1)
+                                pipe.hincrbyfloat(curr, "value_sum", reward)
+                                if curr == node_id: pipe.hset(curr, "tests_failed", pack.get("tests_failed", 1))
+                                c_data = self.r.hgetall(curr)
+                                curr = c_data.get("parent") if c_data else None
+                        except Exception as e: print(f"Memory Error: {e}")
+                        pipe.xack(STREAM_RESULTS, "memory_group", mid)
+                pipe.execute()
+
+if __name__ == "__main__":
+    GlobalMemory().run()
+
+

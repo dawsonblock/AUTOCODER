@@ -1,0 +1,6 @@
+[policy]
+require_hardware_isolation = false
+
+[omega]
+executor_cores = 4
+

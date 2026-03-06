@@ -1,0 +1,243 @@
+use glommio::{
+    io::{DmaFile, OpenOptions},
+    net::{TcpListener, UnixStream},
+    sync::Semaphore,
+    timer::sleep,
+    LocalExecutorBuilder, Placement,
+    prelude::*,
+};
+use futures_lite::{AsyncReadExt, AsyncWriteExt, StreamExt};
+use serde::{Deserialize, Serialize};
+use std::os::unix::io::AsRawFd;
+use std::process::{Child, Command};
+use std::rc::Rc;
+use std::time::{Duration, Instant};
+use std::collections::BTreeMap;
+use ed25519_dalek::{Signer, SigningKey, Signature};
+use sha2::{Sha256, Digest};
+use rand_core::OsRng;
+
+const SNAPSHOT_PATH: &str = "/tmp/omega/assets/vm.snap";
+const MEM_PATH: &str = "/tmp/omega/assets/vm.mem";
+const TEMPLATE_ROOTFS: &str = "/tmp/omega/assets/rootfs.ext4";
+const VM_WORKSPACE: &str = "/tmp/omega/vms";
+const FICLONE: libc::c_ulong = 0x40049409;
+const MAX_CONCURRENT_VMS_PER_CORE: usize = 32;
+
+#[derive(Deserialize, Debug)]
+struct TaskCapsule {
+    id: String,
+    code: String,
+    test_code: String,
+}
+
+#[derive(Serialize)]
+struct VerificationPack {
+    capsule_id: String,
+    success: bool,
+    runtime: f64,
+    node_id: String,
+    hardware_isolated: bool,
+    inputs_digest: String,
+    tests_passed: u32,
+    tests_failed: u32,
+    error_signature: Option<String>,
+    attestation: Option<String>,
+}
+
+#[derive(Deserialize)]
+struct GuestResponse {
+    success: bool,
+    tests_failed: u32,
+    error: Option<String>,
+    runtime: f64,
+}
+
+async fn instant_vm_clone(src_path: &str, dest_path: &str) -> std::io::Result<()> {
+    let src_file = DmaFile::open(src_path).await?;
+    let dst_file = OpenOptions::new().write(true).create(true).dma(dest_path).await?;
+    let ret = unsafe { libc::ioctl(dst_file.as_raw_fd(), FICLONE, src_file.as_raw_fd()) };
+    if ret == 0 {
+        dst_file.close().await?;
+        src_file.close().await?;
+        return Ok(());
+    }
+    // Fallback block copy
+    let file_size = src_file.file_size().await?;
+    let mut offset = 0u64;
+    while offset < file_size {
+        let size = std::cmp::min(128 * 1024, file_size - offset) as usize;
+        let buf = src_file.read_at_aligned(offset, size).await?;
+        dst_file.write_at(buf, offset).await?;
+        offset += size as u64;
+    }
+    dst_file.close().await?;
+    src_file.close().await?;
+    Ok(())
+}
+
+async fn send_put(stream: &mut UnixStream, path: &str, body: &str) -> std::io::Result<()> {
+    let req = format!("PUT {} HTTP/1.1\r\nHost: localhost\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{}", path, body.len(), body);
+    stream.write_all(req.as_bytes()).await?;
+    let mut buf = vec![0u8; 1024];
+    let n = stream.read(&mut buf).await?;
+    let resp = std::str::from_utf8(&buf[..n]).unwrap_or("");
+    if !resp.contains("204 No Content") {
+        return Err(std::io::Error::new(std::io::ErrorKind::Other, "FC API Error"));
+    }
+    Ok(())
+}
+
+async fn restore_golden_vm(fc_socket: &str, rootfs: &str, vsock: &str) -> std::io::Result<Child> {
+    let sock_clone = fc_socket.to_string();
+    let child = glommio::executor().spawn_blocking(move || {
+        Command::new("firecracker").args(&["--api-sock", &sock_clone]).spawn().unwrap()
+    }).await;
+
+    let deadline = Instant::now() + Duration::from_secs(3);
+    let mut stream = loop {
+        if Instant::now() > deadline { return Err(std::io::Error::new(std::io::ErrorKind::TimedOut, "Timeout")); }
+        if let Ok(s) = UnixStream::connect(fc_socket).await { break s; }
+        sleep(Duration::from_millis(2)).await;
+    };
+
+    let snap_body = serde_json::json!({"snapshot_path": SNAPSHOT_PATH, "mem_file_path": MEM_PATH, "enable_diff_snapshots": false}).to_string();
+    send_put(&mut stream, "/snapshot/load", &snap_body).await?;
+
+    let drive_body = serde_json::json!({"drive_id": "rootfs", "path_on_host": rootfs, "is_root_device": true, "is_read_only": false}).to_string();
+    send_put(&mut stream, "/drives/rootfs", &drive_body).await?;
+
+    let vsock_body = serde_json::json!({"vsock_id": "vsock0", "guest_cid": 3, "uds_path": vsock}).to_string();
+    send_put(&mut stream, "/vsock", &vsock_body).await?;
+
+    send_put(&mut stream, "/actions", r#"{"action_type":"Resume"}"#).await?;
+    Ok(child)
+}
+
+fn sign_pack(pack: &mut VerificationPack, key: &SigningKey) {
+    // CRITICAL FIX: Use BTreeMap to guarantee key sorting matching Python's sort_keys=True
+    let mut core_map = BTreeMap::new();
+    core_map.insert("capsule_id", serde_json::Value::String(pack.capsule_id.clone()));
+    core_map.insert("inputs_digest", serde_json::Value::String(pack.inputs_digest.clone()));
+    core_map.insert("success", serde_json::Value::Bool(pack.success));
+
+    // Serialize map strictly without spaces
+    let mut canonical = Vec::new();
+    let mut ser = serde_json::Serializer::with_formatter(&mut canonical, serde_json::ser::CompactFormatter);
+    core_map.serialize(&mut ser).unwrap();
+
+    let digest = Sha256::digest(&canonical);
+    let sig: Signature = key.sign(&digest);
+    pack.attestation = Some(base64::encode(sig.to_bytes()));
+}
+
+async fn run_core_event_loop(core_id: usize, signing_key: Rc<SigningKey>) {
+    let bind_addr = format!("127.0.0.1:{}", 8000 + core_id);
+    let listener = TcpListener::bind(&bind_addr).expect("Bind failed");
+    let concurrency_limit = Rc::new(Semaphore::new(MAX_CONCURRENT_VMS_PER_CORE as _));
+
+    println!("[Core {}] ⚡ io_uring Ring Online -> {}", core_id, bind_addr);
+    let mut incoming = listener.incoming();
+    
+    while let Some(stream_result) = incoming.next().await {
+        let mut network_stream = match stream_result { Ok(s) => s, Err(_) => continue };
+        let permit = concurrency_limit.acquire_permit(1).await.unwrap();
+        let key_clone = Rc::clone(&signing_key);
+
+        glommio::spawn_local(async move {
+            let _guard = permit;
+            let mut buf = Vec::new();
+            if network_stream.read_to_end(&mut buf).await.is_err() { return; }
+            let payload: TaskCapsule = match serde_json::from_slice(&buf) { Ok(c) => c, Err(_) => return };
+
+            let start = Instant::now();
+            let vm_id = format!("vm_{}_{}", core_id, payload.id);
+            let rootfs = format!("{}/{}.ext4", VM_WORKSPACE, vm_id);
+            let fc_sock = format!("{}/{}.sock", VM_WORKSPACE, vm_id);
+            let vsock = format!("{}/{}.vsock", VM_WORKSPACE, vm_id);
+            
+            let mut fc_child = None;
+            let mut success = false;
+            let mut err_sig = None;
+            let mut tests_fail = 1;
+            let mut guest_runtime = 0.0;
+
+            if instant_vm_clone(TEMPLATE_ROOTFS, &rootfs).await.is_ok() {
+                if let Ok(child) = restore_golden_vm(&fc_sock, &rootfs, &vsock).await {
+                    fc_child = Some(child);
+                    let vsock_conn = format!("{}_52", vsock);
+                    let mut vsock_stream = loop {
+                        if Instant::now() > start + Duration::from_secs(2) { break None; }
+                        if let Ok(mut s) = UnixStream::connect(&vsock_conn).await {
+                            let _ = s.write_all(b"CONNECT 52\n").await;
+                            let mut ack = [0u8; 32];
+                            if let Ok(n) = s.read(&mut ack).await {
+                                if std::str::from_utf8(&ack[..n]).unwrap_or("").starts_with("OK") { break Some(s); }
+                            }
+                        }
+                        sleep(Duration::from_millis(2)).await;
+                    };
+
+                    if let Some(mut s) = vsock_stream {
+                        let exec_payload = serde_json::json!({
+                            "code": payload.code, 
+                            "test_code": payload.test_code
+                        }).to_string();
+                        let _ = s.write_all(exec_payload.as_bytes()).await;
+                        
+                        let mut res_buf = vec![0; 65536];
+                        if let Ok(n) = s.read(&mut res_buf).await {
+                            if let Ok(guest_res) = serde_json::from_slice::<GuestResponse>(&res_buf[..n]) {
+                                success = guest_res.success;
+                                tests_fail = guest_res.tests_failed;
+                                err_sig = guest_res.error;
+                                guest_runtime = guest_res.runtime;
+                            }
+                        }
+                    }
+                }
+            }
+
+            glommio::executor().spawn_blocking(move || {
+                if let Some(mut c) = fc_child { let _ = c.kill(); let _ = c.wait(); }
+                let _ = std::fs::remove_file(&rootfs);
+                let _ = std::fs::remove_file(&fc_sock);
+                let _ = std::fs::remove_file(&format!("{}_52", vsock));
+            }).await;
+
+            let mut pack = VerificationPack {
+                capsule_id: payload.id.clone(), success, runtime: start.elapsed().as_secs_f64(),
+                node_id: format!("core_{}", core_id), hardware_isolated: true,
+                inputs_digest: hex::encode(Sha256::digest(payload.code.as_bytes())),
+                tests_passed: if success { 1 } else { 0 }, tests_failed: tests_fail,
+                error_signature: err_sig, attestation: None,
+            };
+            sign_pack(&mut pack, &key_clone);
+
+            if let Ok(response) = serde_json::to_string(&pack) {
+                let _ = network_stream.write_all(response.as_bytes()).await;
+            }
+        }).detach();
+    }
+}
+
+fn main() {
+    let num_cores = std::thread::available_parallelism().map(|n| n.get()).unwrap_or(1).min(4);
+    let mut csprng = OsRng;
+    let signing_key = SigningKey::generate(&mut csprng);
+    println!(">>> KERNEL Ω V19 DATA PLANE [PubKey: {}] <<<", hex::encode(signing_key.verifying_key().to_bytes()));
+
+    let _ = std::fs::create_dir_all(VM_WORKSPACE);
+    let mut handles = Vec::new();
+    for core_id in 0..num_cores {
+        let key_ref = Rc::new(signing_key.clone());
+        handles.push(std::thread::spawn(move || {
+            LocalExecutorBuilder::new(Placement::Fixed(core_id))
+                .spawn(move || async move { run_core_event_loop(core_id, key_ref).await; })
+                .unwrap().join().unwrap();
+        }));
+    }
+    for h in handles { h.join().unwrap(); }
+}
+
+

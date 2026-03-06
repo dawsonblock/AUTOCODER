@@ -1,0 +1,32 @@
+#!/usr/bin/env python3
+import sys, redis
+
+def fix_tests(file_path: str, test_path: str):
+    print(f"[*] Initializing Kernel Ω for {file_path} against {test_path}...")
+    try:
+        with open(file_path, "r") as f: code = f.read()
+        with open(test_path, "r") as f: test_code = f.read()
+    except FileNotFoundError:
+        print("Source or test file not found.")
+        return
+
+    r = redis.Redis(host="localhost", port=6379, decode_responses=True)
+    task_id = "task_alpha"
+    root_id = f"omega:tree:{task_id}:root"
+    
+    r.hset(root_id, mapping={
+        "code": code, 
+        "test_code": test_code,
+        "parent": "", 
+        "visits": 0, 
+        "value_sum": 0.0, 
+        "tests_failed": 999, 
+        "is_terminal": "False"
+    })
+    print(f"[✓] Task seeded to Distributed Forest. Launch workers to resolve.")
+
+if __name__ == "__main__":
+    if len(sys.argv) > 3 and sys.argv[1] == "fix": fix_tests(sys.argv[2], sys.argv[3])
+    else: print("Usage: omega fix <source_file> <test_file>")
+
+

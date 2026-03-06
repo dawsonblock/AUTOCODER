@@ -1,0 +1,19 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "kernel-omega"
+version = "19.0.0"
+description = "Deterministic autonomous software-repair fabric"
+readme = "README.md"
+requires-python = ">=3.11"
+authors = [{ name = "Codex" }]
+dependencies = []
+
+[project.scripts]
+omega = "control_plane.omega_cli:main"
+
+[tool.setuptools]
+packages = ["control_plane"]
+

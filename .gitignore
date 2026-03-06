@@ -1,0 +1,36 @@
+# Python
+.venv/
+__pycache__/
+*.pyc
+*.pyo
+*.egg-info/
+dist/
+build/
+
+# Testing & Linting
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage*
+coverage.json
+htmlcov/
+
+# Rust
+**/target/
+
+# Node
+node_modules/
+dashboard/dist/
+
+# macOS
+.DS_Store
+
+# Project
+.omega-cas/
+tmp/
+
+# Editor
+.vscode/
+.idea/
+*.swp
+*.swo

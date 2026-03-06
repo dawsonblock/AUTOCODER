@@ -1,0 +1,18 @@
+[package]
+name = "omega_hypervisor"
+version = "19.0.0"
+edition = "2021"
+
+[dependencies]
+glommio = "0.8.0"
+futures-lite = "1.13.0"
+serde = { version = "1.0", features = ["derive", "Serialize", "Deserialize"] }
+serde_json = "1.0"
+libc = "0.2"
+ed25519-dalek = { version = "2.0.0", features = ["rand_core"] }
+sha2 = "0.10.8"
+base64 = "0.21.4"
+hex = "0.4.3"
+rand_core = { version = "0.6.4", features = ["std"] }
+
+

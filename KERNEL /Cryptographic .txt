@@ -1,0 +1,67 @@
+import os, json, hashlib, base64, ast, redis, nacl.signing, nacl.exceptions
+
+REDIS_HOST = os.getenv("OMEGA_REDIS_HOST", "localhost")
+STREAM_RESULTS = "omega:stream:results"
+STREAM_ACCEPTED = "omega:stream:accepted"
+
+class PolicyGate:
+    def __init__(self):
+        if "OMEGA_TRUSTED_PUBKEY" not in os.environ:
+            raise RuntimeError("FATAL: OMEGA_TRUSTED_PUBKEY environment variable missing.")
+        self.trusted_pubkey = os.environ["OMEGA_TRUSTED_PUBKEY"]
+        self.r = redis.Redis(host=REDIS_HOST, port=6379, decode_responses=True)
+        try: self.r.xgroup_create(STREAM_RESULTS, "policy_group", id="0", mkstream=True)
+        except: pass
+        print("[Policy Gate] 🔐 Online. Strict Ed25519 cryptography enforced.")
+
+    def verify_signature(self, pack: dict) -> bool:
+        if "attestation" not in pack or not pack["attestation"]: return False
+        sig_b64 = pack.pop("attestation")
+        
+        # Python json.dumps with sort_keys matches Rust's BTreeMap deterministic ordering
+        core = {"capsule_id": pack["capsule_id"], "inputs_digest": pack.get("inputs_digest", ""), "success": pack.get("success", False)}
+        canonical_bytes = json.dumps(core, sort_keys=True, separators=(',', ':')).encode('utf-8')
+        digest = hashlib.sha256(canonical_bytes).digest()
+
+        try:
+            vk = nacl.signing.VerifyKey(bytes.fromhex(self.trusted_pubkey))
+            vk.verify(digest, base64.b64decode(sig_b64))
+            pack["attestation"] = sig_b64
+            return True
+        except nacl.exceptions.BadSignatureError:
+            return False
+
+    def enforce_semantic_policy(self, code: str) -> bool:
+        try: tree = ast.parse(code)
+        except SyntaxError: return False
+        for node in ast.walk(tree):
+            if isinstance(node, ast.Try):
+                for handler in node.handlers:
+                    if handler.type is None or (isinstance(handler.type, ast.Name) and handler.type.id in ("Exception", "BaseException")):
+                        return False
+            if isinstance(node, ast.Attribute) and node.attr in ("skip", "xfail"): return False
+        return True
+
+    def run(self):
+        while True:
+            entries = self.r.xreadgroup("policy_group", "gate_1", {STREAM_RESULTS: ">"}, count=50, block=5000)
+            if entries:
+                pipe = self.r.pipeline()
+                for stream, msgs in entries:
+                    for mid, msg in msgs:
+                        try:
+                            pack = json.loads(msg["payload"])
+                            if self.verify_signature(pack) and pack.get("success", False) and pack.get("tests_failed", 1) == 0:
+                                node_data = self.r.hgetall(pack["capsule_id"])
+                                if node_data and self.enforce_semantic_policy(node_data.get("code", "")):
+                                    print(f"[Policy] ✓ ACCEPTED {pack['capsule_id'][:8]}")
+                                    pipe.xadd(STREAM_ACCEPTED, {"payload": json.dumps({"capsule_id": pack["capsule_id"], "code": node_data["code"]})})
+                                else: print(f"[Policy] ❌ REJECTED {pack['capsule_id'][:8]} (Semantic Violation)")
+                        except Exception as e: print(f"[Policy Error] {e}")
+                        pipe.xack(STREAM_RESULTS, "policy_group", mid)
+                pipe.execute()
+
+if __name__ == "__main__":
+    PolicyGate().run()
+
+

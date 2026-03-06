@@ -1,0 +1,23 @@
+[repo]
+language = "python"
+package_manager = "pip"
+
+[omega]
+redis = "redis://127.0.0.1:6379"
+cas_endpoint = "http://127.0.0.1:9000"
+cas_bucket = "omega-cas"
+
+[budgets]
+max_capsules = 200
+max_wall_seconds = 600
+max_diff_lines = 10
+max_touched_files = 1
+max_depth = 6
+max_children = 4
+
+[policy]
+deny_edit_tests = true
+deny_disable_asserts = true
+require_hardware_isolation = true
+
+
