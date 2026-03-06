@@ -77,11 +77,15 @@ class ThreadedExecutorServer(socketserver.ThreadingTCPServer):
             "tests_failed": 1,
             "error": "Unknown",
             "runtime": 0.0,
+            "meta": {},
         }
+        materialize_ms = 0.0
+        artifact_started = 0.0
         try:
             with tempfile.TemporaryDirectory(prefix="omega_sim_") as tmp_dir:
                 tmp_repo = Path(tmp_dir) / "repo"
                 tmp_repo.mkdir(parents=True, exist_ok=True)
+                materialize_started = time.perf_counter()
                 _materialize_snapshot(tmp_repo, capsule.repo_snapshot)
                 target_source = _safe_target(tmp_repo, capsule.source_relpath or Path(capsule.source_path).name)
                 target_test = _safe_target(tmp_repo, capsule.test_relpath or Path(capsule.test_path).name)
@@ -89,6 +93,7 @@ class ThreadedExecutorServer(socketserver.ThreadingTCPServer):
                 target_test.parent.mkdir(parents=True, exist_ok=True)
                 target_source.write_text(capsule.code, encoding="utf-8")
                 target_test.write_text(capsule.test_code, encoding="utf-8")
+                materialize_ms = (time.perf_counter() - materialize_started) * 1000.0
                 proc = subprocess.run(
                     [
                         sys.executable,
@@ -109,17 +114,22 @@ class ThreadedExecutorServer(socketserver.ThreadingTCPServer):
         except Exception as exc:
             result_json["error"] = str(exc)
 
+        artifact_started = time.perf_counter()
         artifact_uri = self.store.put_bundle(
             "executions",
             {
+                "run_id": capsule.run_id,
                 "capsule": json.loads(capsule.to_json()),
                 "funnel_result": result_json,
                 "executor": self.node_id,
             },
         )
+        artifact_ms = (time.perf_counter() - artifact_started) * 1000.0
+        funnel_meta = result_json.get("meta", {}) if isinstance(result_json.get("meta"), dict) else {}
 
         pack = VerificationPack(
             capsule_id=capsule.id,
+            run_id=capsule.run_id,
             success=bool(result_json.get("success", False)),
             runtime=time.perf_counter() - started,
             node_id=self.node_id,
@@ -129,6 +139,18 @@ class ThreadedExecutorServer(socketserver.ThreadingTCPServer):
             tests_failed=int(result_json.get("tests_failed", 1)),
             error_signature=result_json.get("error"),
             artifact_uri=artifact_uri,
+            meta={
+                "transport": {
+                    "repo_snapshot_bytes": capsule.repo_snapshot_bytes,
+                    "repo_snapshot_files": capsule.repo_snapshot_files,
+                    "repo_snapshot_digest": capsule.repo_snapshot_digest,
+                },
+                "simulator": {
+                    "materialize_ms": materialize_ms,
+                    "artifact_write_ms": artifact_ms,
+                },
+                "funnel": funnel_meta,
+            },
         )
         sign_pack(pack, self.signing_key)
         self.redis.xadd(STREAM_RESULTS, {"payload": pack.to_json()})

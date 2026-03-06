@@ -9,6 +9,7 @@ def test_signature_round_trip() -> None:
     signing_key = nacl.signing.SigningKey.generate()
     pack = VerificationPack(
         capsule_id="omega:tree:task:deadbeef",
+        run_id="run_deadbeef",
         success=True,
         runtime=0.02,
         node_id="sim-core-0",
@@ -26,6 +27,7 @@ def test_signature_rejects_tampered_trust_fields() -> None:
     signing_key = nacl.signing.SigningKey.generate()
     pack = VerificationPack(
         capsule_id="omega:tree:task:deadbeef",
+        run_id="run_deadbeef",
         success=True,
         runtime=0.02,
         node_id="sim-core-0",
@@ -54,6 +56,7 @@ def test_policy_gate_rejects_digest_mismatch() -> None:
     signing_key = nacl.signing.SigningKey.generate()
     pack = VerificationPack(
         capsule_id="omega:tree:task:deadbeef",
+        run_id="run_deadbeef",
         success=True,
         runtime=0.02,
         node_id="sim-core-0",

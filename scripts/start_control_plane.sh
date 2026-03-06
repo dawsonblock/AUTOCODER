@@ -101,6 +101,7 @@ start_service() {
 start_service global_memory "$ROOT_DIR/.venv/bin/python" -m control_plane.global_memory --profile "$PROFILE"
 start_service policy_gate "$ROOT_DIR/.venv/bin/python" -m control_plane.policy_gate --profile "$PROFILE"
 start_service merger "$ROOT_DIR/.venv/bin/python" -m control_plane.merger --profile "$PROFILE"
+start_service dispatcher "$ROOT_DIR/.venv/bin/python" -m control_plane.dispatcher --profile "$PROFILE"
 start_service telemetry_api "$ROOT_DIR/.venv/bin/python" -m control_plane.telemetry_api --profile "$PROFILE"
 
 for index in $(seq 1 "$WORKERS"); do

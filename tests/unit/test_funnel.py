@@ -50,6 +50,9 @@ def test_execute_funnel_runs_full_suite_after_targeted(monkeypatch) -> None:
     assert result["tests_passed"] == 3
     assert result["tests_failed"] == 1
     assert result["success"] is False
+    assert result["meta"]["failed_stage"] == "full_suite"
+    assert result["meta"]["full_suite_attempted"] is True
+    assert result["meta"]["stages"]["full_suite_ms"] >= 0
 
 
 def test_execute_funnel_falls_back_to_one_failure_without_summary(monkeypatch) -> None:
@@ -71,3 +74,25 @@ def test_execute_funnel_falls_back_to_one_failure_without_summary(monkeypatch) -
 
     assert result["tests_failed"] == 1
     assert result["success"] is False
+    assert result["meta"]["failed_stage"] == "full_suite"
+
+
+def test_execute_funnel_returns_stage_metadata_on_targeted_failure(monkeypatch) -> None:
+    funnel = load_funnel_module()
+
+    def fake_run_cmd(cmd, cwd=None, timeout=30):
+        if cmd[0] in {"ruff", "mypy"}:
+            return True, ""
+        if cmd == ["pytest", "tests/test_algo.py", "-q", "-x", "--disable-warnings"]:
+            return False, "1 failed in 0.01s"
+        raise AssertionError(f"unexpected command: {cmd}")
+
+    monkeypatch.setattr(funnel, "_tool", lambda name: name)
+    monkeypatch.setattr(funnel, "run_cmd", fake_run_cmd)
+
+    result = funnel.execute_funnel("src/algo.py", "tests/test_algo.py", cwd="/repo")
+
+    assert result["success"] is False
+    assert result["meta"]["failed_stage"] == "targeted_pytest"
+    assert result["meta"]["full_suite_attempted"] is False
+    assert result["meta"]["stages"]["targeted_pytest_ms"] >= 0

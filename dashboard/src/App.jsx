@@ -19,6 +19,15 @@ const defaultSnapshot = {
     totalEvals: 0,
     evalsPerSec: 0,
   },
+  performance: {
+    avgSeedMs: 0,
+    avgCoverageMs: 0,
+    avgGenerationMs: 0,
+    avgQueueWaitMs: 0,
+    avgExecutorMs: 0,
+    avgFullSuiteMs: 0,
+    avgSnapshotBytes: 0,
+  },
   liveRuns: [],
   forestState: [],
 };
@@ -73,7 +82,7 @@ function MetricCard({ icon: Icon, label, value, tone }) {
 
 export default function App() {
   const { snapshot, error } = useDashboardSnapshot();
-  const { metrics, liveRuns, forestState } = snapshot;
+  const { metrics, performance, liveRuns, forestState } = snapshot;
 
   return (
     <div className="shell">
@@ -177,6 +186,39 @@ export default function App() {
           </div>
         </section>
 
+        <section className="panel panel-wide">
+          <div className="panel-header">
+            <h2>Performance Hotspots</h2>
+            <span>Current audit baseline</span>
+          </div>
+          <div className="table-wrap">
+            <table>
+              <thead>
+                <tr>
+                  <th>Stage</th>
+                  <th>Average</th>
+                </tr>
+              </thead>
+              <tbody>
+                {[
+                  ["Seed", `${performance.avgSeedMs.toFixed(1)} ms`],
+                  ["Coverage", `${performance.avgCoverageMs.toFixed(1)} ms`],
+                  ["Generation", `${performance.avgGenerationMs.toFixed(1)} ms`],
+                  ["Queue wait", `${performance.avgQueueWaitMs.toFixed(1)} ms`],
+                  ["Executor", `${performance.avgExecutorMs.toFixed(1)} ms`],
+                  ["Full suite", `${performance.avgFullSuiteMs.toFixed(1)} ms`],
+                  ["Snapshot size", `${Math.round(performance.avgSnapshotBytes)} bytes`],
+                ].map(([label, value]) => (
+                  <tr key={label}>
+                    <td>{label}</td>
+                    <td>{value}</td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          </div>
+        </section>
+
         <section className="panel">
           <div className="panel-header">
             <h2>Search Forest State</h2>
@@ -203,4 +245,3 @@ export default function App() {
     </div>
   );
 }
-

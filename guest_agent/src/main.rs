@@ -6,6 +6,7 @@ fn main() {
 #[cfg(target_os = "linux")]
 mod linux_impl {
     use serde::{Deserialize, Serialize};
+    use serde_json::Value;
     use std::collections::BTreeMap;
     use std::io::{Read, Write};
     use std::path::{Component, Path, PathBuf};
@@ -31,6 +32,30 @@ mod linux_impl {
         tests_failed: u32,
         error: Option<String>,
         runtime: f64,
+        meta: Value,
+    }
+
+    fn read_framed(reader: &mut impl Read, max_len: usize) -> std::io::Result<Vec<u8>> {
+        let mut header = [0_u8; 4];
+        reader.read_exact(&mut header)?;
+        let payload_len = u32::from_be_bytes(header) as usize;
+        if payload_len > max_len {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!("framed payload exceeds limit: {payload_len}"),
+            ));
+        }
+        let mut payload = vec![0_u8; payload_len];
+        reader.read_exact(&mut payload)?;
+        Ok(payload)
+    }
+
+    fn write_framed(writer: &mut impl Write, payload: &[u8]) -> std::io::Result<()> {
+        let payload_len = u32::try_from(payload.len()).map_err(|_| {
+            std::io::Error::new(std::io::ErrorKind::InvalidInput, "payload too large")
+        })?;
+        writer.write_all(&payload_len.to_be_bytes())?;
+        writer.write_all(payload)
     }
 
     fn safe_join(root: &Path, relative: &str) -> std::io::Result<PathBuf> {
@@ -51,7 +76,10 @@ mod linux_impl {
         Ok(root.join(relative_path))
     }
 
-    fn materialize_snapshot(root: &Path, snapshot: &BTreeMap<String, String>) -> std::io::Result<()> {
+    fn materialize_snapshot(
+        root: &Path,
+        snapshot: &BTreeMap<String, String>,
+    ) -> std::io::Result<()> {
         for (relative_path, content) in snapshot {
             let target = safe_join(root, relative_path)?;
             if let Some(parent) = target.parent() {
@@ -94,12 +122,11 @@ mod linux_impl {
 
         for stream in listener.incoming() {
             if let Ok(mut socket) = stream {
-                let mut buffer = vec![0_u8; 1024 * 1024];
-                if let Ok(bytes_read) = socket.read(&mut buffer) {
-                    if let Ok(payload) = serde_json::from_slice::<Payload>(&buffer[..bytes_read]) {
+                if let Ok(buffer) = read_framed(&mut socket, 4 * 1024 * 1024) {
+                    if let Ok(payload) = serde_json::from_slice::<Payload>(&buffer) {
                         match execute_payload(&payload) {
                             Ok(proc) => {
-                                let _ = socket.write_all(&proc.stdout);
+                                let _ = write_framed(&mut socket, &proc.stdout);
                             }
                             Err(error) => {
                                 let failure = FailureResult {
@@ -108,9 +135,10 @@ mod linux_impl {
                                     tests_failed: 1,
                                     error: Some(error.to_string()),
                                     runtime: 0.0,
+                                    meta: Value::Object(Default::default()),
                                 };
                                 if let Ok(serialized) = serde_json::to_vec(&failure) {
-                                    let _ = socket.write_all(&serialized);
+                                    let _ = write_framed(&mut socket, &serialized);
                                 }
                             }
                         }

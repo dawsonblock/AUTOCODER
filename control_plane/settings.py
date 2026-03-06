@@ -32,6 +32,11 @@ class RepoConfig:
 
 
 @dataclass
+class MetadataSettings:
+    postgres_url: str
+
+
+@dataclass
 class OmegaSettings:
     redis: str
     cas_endpoint: str
@@ -67,6 +72,7 @@ class PolicySettings:
 @dataclass
 class AppConfig:
     repo: RepoConfig
+    metadata: MetadataSettings
     omega: OmegaSettings
     budgets: BudgetSettings
     policy: PolicySettings
@@ -84,8 +90,10 @@ def load_config(profile: str = "omega") -> AppConfig:
         with profile_path.open("rb") as handle:
             merged = _merge_dicts(base_config, tomllib.load(handle))
 
+    metadata = merged["metadata"]
     omega = merged["omega"]
     env_overrides = {
+        "postgres_url": os.getenv("OMEGA_POSTGRES_URL"),
         "redis": os.getenv("OMEGA_REDIS_URL"),
         "cas_endpoint": os.getenv("OMEGA_CAS_ENDPOINT"),
         "cas_bucket": os.getenv("OMEGA_CAS_BUCKET"),
@@ -99,10 +107,14 @@ def load_config(profile: str = "omega") -> AppConfig:
     }
     for key, value in env_overrides.items():
         if value is not None:
-            omega[key] = int(value) if key.endswith("_port") or key.endswith("_cores") else value
+            if key == "postgres_url":
+                metadata[key] = value
+            else:
+                omega[key] = int(value) if key.endswith("_port") or key.endswith("_cores") else value
 
     return AppConfig(
         repo=RepoConfig(**merged["repo"]),
+        metadata=MetadataSettings(**metadata),
         omega=OmegaSettings(**omega),
         budgets=BudgetSettings(**merged["budgets"]),
         policy=PolicySettings(**merged["policy"]),

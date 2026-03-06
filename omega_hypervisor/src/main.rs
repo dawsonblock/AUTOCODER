@@ -10,14 +10,13 @@ mod linux_impl {
     use ed25519_dalek::{Signature, Signer, SigningKey};
     use futures_lite::{AsyncReadExt, AsyncWriteExt, StreamExt};
     use glommio::{
-        io::{DmaFile, OpenOptions},
+        executor,
         net::{TcpListener, UnixStream},
         sync::Semaphore,
         timer::sleep,
         LocalExecutorBuilder, Placement,
     };
     use rand_core::OsRng;
-    use redis::Commands;
     use serde::{Deserialize, Serialize};
     use sha2::{Digest, Sha256};
     use std::collections::BTreeMap;
@@ -25,11 +24,12 @@ mod linux_impl {
     use std::os::unix::io::AsRawFd;
     use std::process::{Child, Command};
     use std::rc::Rc;
+    use std::sync::Arc;
     use std::time::{Duration, Instant};
 
     const SNAPSHOT_PATH: &str = "/tmp/omega/assets/vm.snap";
     const MEM_PATH: &str = "/tmp/omega/assets/vm.mem";
-    const TEMPLATE_ROOTFS: &str = "/tmp/omega/assets/rootfs.ext4";
+    const TEMPLATE_ROOTFS: &str = "/tmp/omega/assets/golden-template/rootfs.ext4";
     const VM_WORKSPACE: &str = "/tmp/omega/vms";
     const ARTIFACT_WORKSPACE: &str = "/tmp/omega/artifacts";
     const FICLONE: libc::c_ulong = 0x40049409;
@@ -37,7 +37,7 @@ mod linux_impl {
     const STREAM_RESULTS: &str = "omega:stream:results";
     const STATS_INFLIGHT: &str = "omega:stats:inflight";
 
-    #[derive(Deserialize, Debug)]
+    #[derive(Serialize, Deserialize, Debug)]
     struct TaskCapsule {
         id: String,
         tree_id: String,
@@ -46,11 +46,19 @@ mod linux_impl {
         code: String,
         test_code: String,
         #[serde(default)]
+        run_id: String,
+        #[serde(default)]
         source_relpath: String,
         #[serde(default)]
         test_relpath: String,
         #[serde(default)]
         repo_snapshot: BTreeMap<String, String>,
+        #[serde(default)]
+        repo_snapshot_digest: String,
+        #[serde(default)]
+        repo_snapshot_bytes: usize,
+        #[serde(default)]
+        repo_snapshot_files: usize,
     }
 
     #[derive(Serialize, Deserialize)]
@@ -60,11 +68,14 @@ mod linux_impl {
         tests_failed: u32,
         error: Option<String>,
         runtime: f64,
+        #[serde(default)]
+        meta: serde_json::Value,
     }
 
     #[derive(Serialize)]
     struct VerificationPack {
         capsule_id: String,
+        run_id: String,
         success: bool,
         runtime: f64,
         node_id: String,
@@ -75,34 +86,41 @@ mod linux_impl {
         error_signature: Option<String>,
         attestation: Option<String>,
         artifact_uri: Option<String>,
+        meta: serde_json::Value,
     }
 
     async fn instant_vm_clone(src_path: &str, dest_path: &str) -> std::io::Result<()> {
-        let src_file = DmaFile::open(src_path).await?;
-        let dst_file = OpenOptions::new().write(true).create(true).dma(dest_path).await?;
-        let cloned = unsafe { libc::ioctl(dst_file.as_raw_fd(), FICLONE, src_file.as_raw_fd()) };
-        if cloned == 0 {
-            dst_file.close().await?;
-            src_file.close().await?;
-            return Ok(());
-        }
-
-        let file_size = src_file.file_size().await?;
-        let mut offset = 0_u64;
-        while offset < file_size {
-            let size = std::cmp::min(128 * 1024, file_size - offset) as usize;
-            let buffer = src_file.read_at_aligned(offset, size).await?;
-            dst_file.write_at(buffer, offset).await?;
-            offset += size as u64;
-        }
-        dst_file.close().await?;
-        src_file.close().await?;
-        Ok(())
+        let src_path = src_path.to_string();
+        let dest_path = dest_path.to_string();
+        executor()
+            .spawn_blocking(move || {
+                let src_file = std::fs::File::open(&src_path)?;
+                let dst_file = std::fs::OpenOptions::new()
+                    .write(true)
+                    .create(true)
+                    .truncate(true)
+                    .open(&dest_path)?;
+                let cloned =
+                    unsafe { libc::ioctl(dst_file.as_raw_fd(), FICLONE, src_file.as_raw_fd()) };
+                if cloned == 0 {
+                    return Ok(());
+                }
+                drop(dst_file);
+                std::fs::copy(&src_path, &dest_path)?;
+                Ok(())
+            })
+            .await
     }
 
-    async fn send_put(stream: &mut UnixStream, path: &str, body: &str) -> std::io::Result<()> {
+    async fn send_json(
+        stream: &mut UnixStream,
+        method: &str,
+        path: &str,
+        body: &str,
+    ) -> std::io::Result<()> {
         let request = format!(
-            "PUT {} HTTP/1.1\r\nHost: localhost\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{}",
+            "{} {} HTTP/1.1\r\nHost: localhost\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{}",
+            method,
             path,
             body.len(),
             body
@@ -112,19 +130,57 @@ mod linux_impl {
         let bytes = stream.read(&mut buffer).await?;
         let response = std::str::from_utf8(&buffer[..bytes]).unwrap_or("");
         if !response.contains("204 No Content") {
-            return Err(std::io::Error::new(std::io::ErrorKind::Other, "Firecracker API error"));
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::Other,
+                "Firecracker API error",
+            ));
         }
         Ok(())
     }
 
-    async fn restore_golden_vm(fc_socket: &str, rootfs: &str, vsock: &str) -> std::io::Result<Child> {
+    async fn write_framed(stream: &mut UnixStream, payload: &[u8]) -> std::io::Result<()> {
+        let length = u32::try_from(payload.len()).map_err(|_| {
+            std::io::Error::new(std::io::ErrorKind::InvalidInput, "payload too large")
+        })?;
+        stream.write_all(&length.to_be_bytes()).await?;
+        stream.write_all(payload).await
+    }
+
+    async fn read_framed(stream: &mut UnixStream, max_len: usize) -> std::io::Result<Vec<u8>> {
+        let mut header = [0_u8; 4];
+        stream.read_exact(&mut header).await?;
+        let payload_len = u32::from_be_bytes(header) as usize;
+        if payload_len > max_len {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!("framed payload exceeds limit: {payload_len}"),
+            ));
+        }
+        let mut payload = vec![0_u8; payload_len];
+        stream.read_exact(&mut payload).await?;
+        Ok(payload)
+    }
+
+    async fn restore_golden_vm(fc_socket: &str, vm_dir: &str) -> std::io::Result<Child> {
         let sock_clone = fc_socket.to_string();
-        let child = glommio::spawn_blocking(move || Command::new("firecracker").args(["--api-sock", &sock_clone]).spawn().unwrap()).await;
+        let vm_dir = vm_dir.to_string();
+        let child = executor()
+            .spawn_blocking(move || {
+                Command::new("firecracker")
+                    .current_dir(&vm_dir)
+                    .args(["--api-sock", &sock_clone])
+                    .spawn()
+                    .unwrap()
+            })
+            .await;
 
         let deadline = Instant::now() + Duration::from_secs(3);
         let mut stream = loop {
             if Instant::now() > deadline {
-                return Err(std::io::Error::new(std::io::ErrorKind::TimedOut, "Firecracker socket timeout"));
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::TimedOut,
+                    "Firecracker socket timeout",
+                ));
             }
             if let Ok(sock) = UnixStream::connect(fc_socket).await {
                 break sock;
@@ -135,34 +191,21 @@ mod linux_impl {
         let snapshot = serde_json::json!({
             "snapshot_path": SNAPSHOT_PATH,
             "mem_file_path": MEM_PATH,
-            "enable_diff_snapshots": false
+            "enable_diff_snapshots": false,
+            "resume_vm": false
         })
         .to_string();
-        send_put(&mut stream, "/snapshot/load", &snapshot).await?;
-
-        let drive = serde_json::json!({
-            "drive_id": "rootfs",
-            "path_on_host": rootfs,
-            "is_root_device": true,
-            "is_read_only": false
-        })
-        .to_string();
-        send_put(&mut stream, "/drives/rootfs", &drive).await?;
-
-        let vsock_body = serde_json::json!({
-            "vsock_id": "vsock0",
-            "guest_cid": 3,
-            "uds_path": vsock
-        })
-        .to_string();
-        send_put(&mut stream, "/vsock", &vsock_body).await?;
-        send_put(&mut stream, "/actions", r#"{"action_type":"Resume"}"#).await?;
+        send_json(&mut stream, "PUT", "/snapshot/load", &snapshot).await?;
+        send_json(&mut stream, "PATCH", "/vm", r#"{"state":"Resumed"}"#).await?;
         Ok(child)
     }
 
     fn sign_pack(pack: &mut VerificationPack, signing_key: &SigningKey) {
         let mut core = BTreeMap::new();
-        core.insert("capsule_id", serde_json::Value::String(pack.capsule_id.clone()));
+        core.insert(
+            "capsule_id",
+            serde_json::Value::String(pack.capsule_id.clone()),
+        );
         core.insert(
             "error_signature",
             match &pack.error_signature {
@@ -174,7 +217,11 @@ mod linux_impl {
             "hardware_isolated",
             serde_json::Value::Bool(pack.hardware_isolated),
         );
-        core.insert("inputs_digest", serde_json::Value::String(pack.inputs_digest.clone()));
+        core.insert(
+            "inputs_digest",
+            serde_json::Value::String(pack.inputs_digest.clone()),
+        );
+        core.insert("run_id", serde_json::Value::String(pack.run_id.clone()));
         core.insert("success", serde_json::Value::Bool(pack.success));
         core.insert(
             "tests_failed",
@@ -193,11 +240,17 @@ mod linux_impl {
         pack.attestation = Some(BASE64_STANDARD.encode(signature.to_bytes()));
     }
 
-    fn persist_artifact(capsule_id: &str, capsule: &TaskCapsule, guest_response: &GuestResponse) -> Option<String> {
-        let path = std::path::Path::new(ARTIFACT_WORKSPACE).join(format!("{}.json", capsule_id.replace(':', "_")));
+    fn persist_artifact(
+        capsule_id: &str,
+        capsule: &TaskCapsule,
+        guest_response: &GuestResponse,
+    ) -> Option<String> {
+        let path = std::path::Path::new(ARTIFACT_WORKSPACE)
+            .join(format!("{}.json", capsule_id.replace(':', "_")));
         std::fs::create_dir_all(ARTIFACT_WORKSPACE).ok()?;
         let payload = serde_json::json!({
             "capsule": capsule,
+            "run_id": capsule.run_id,
             "guest_response": guest_response,
         });
         let mut file = std::fs::File::create(&path).ok()?;
@@ -210,25 +263,29 @@ mod linux_impl {
             Ok(value) => value,
             Err(_) => return,
         };
-        let _ = glommio::spawn_blocking(move || {
-            let client = redis::Client::open(redis_url.as_str()).ok()?;
-            let mut connection = client.get_connection().ok()?;
-            let _: () = redis::cmd("XADD")
-                .arg(STREAM_RESULTS)
-                .arg("*")
-                .arg("payload")
-                .arg(serialized)
-                .query(&mut connection)
-                .ok()?;
-            let _: () = redis::cmd("DECR").arg(STATS_INFLIGHT).query(&mut connection).ok()?;
-            Some(())
-        })
-        .await;
+        let _ = executor()
+            .spawn_blocking(move || {
+                let client = redis::Client::open(redis_url.as_str()).ok()?;
+                let mut connection = client.get_connection().ok()?;
+                let _: () = redis::cmd("XADD")
+                    .arg(STREAM_RESULTS)
+                    .arg("*")
+                    .arg("payload")
+                    .arg(serialized)
+                    .query(&mut connection)
+                    .ok()?;
+                let _: () = redis::cmd("DECR")
+                    .arg(STATS_INFLIGHT)
+                    .query(&mut connection)
+                    .ok()?;
+                Some(())
+            })
+            .await;
     }
 
     async fn run_core_event_loop(
         core_id: usize,
-        signing_key: Rc<SigningKey>,
+        signing_key: Arc<SigningKey>,
         redis_url: String,
         executor_host: String,
         executor_base_port: u16,
@@ -244,8 +301,8 @@ mod linux_impl {
                 Ok(stream) => stream,
                 Err(_) => continue,
             };
-            let permit = semaphore.acquire_permit(1).await.unwrap();
-            let key = Rc::clone(&signing_key);
+            let permit = semaphore.acquire_static_permit(1).await.unwrap();
+            let key = Arc::clone(&signing_key);
             let redis_for_task = redis_url.clone();
 
             glommio::spawn_local(async move {
@@ -261,20 +318,39 @@ mod linux_impl {
 
                 let started = Instant::now();
                 let vm_id = format!("vm_{}_{}", core_id, capsule.id.replace(':', "_"));
-                let rootfs = format!("{}/{}.ext4", VM_WORKSPACE, vm_id);
-                let fc_socket = format!("{}/{}.sock", VM_WORKSPACE, vm_id);
-                let vsock = format!("{}/{}.vsock", VM_WORKSPACE, vm_id);
+                let vm_dir = format!("{}/{}", VM_WORKSPACE, vm_id);
+                let rootfs = format!("{}/rootfs.ext4", vm_dir);
+                let fc_socket = format!("{}/firecracker.sock", vm_dir);
+                let vsock = format!("{}/vsock.sock", vm_dir);
                 let mut guest_response = GuestResponse {
                     success: false,
                     tests_passed: 0,
                     tests_failed: 1,
                     error: Some("VMFailure".to_string()),
                     runtime: 0.0,
+                    meta: serde_json::Value::Object(Default::default()),
                 };
                 let mut firecracker: Option<Child> = None;
+                let mut clone_ms = 0.0;
+                let mut restore_ms = 0.0;
+                let mut vsock_roundtrip_ms = 0.0;
 
+                let _ = executor()
+                    .spawn_blocking({
+                        let vm_dir = vm_dir.clone();
+                        move || {
+                            let _ = std::fs::remove_dir_all(&vm_dir);
+                            std::fs::create_dir_all(&vm_dir)
+                        }
+                    })
+                    .await;
+
+                let clone_started = Instant::now();
                 if instant_vm_clone(TEMPLATE_ROOTFS, &rootfs).await.is_ok() {
-                    if let Ok(child) = restore_golden_vm(&fc_socket, &rootfs, &vsock).await {
+                    clone_ms = clone_started.elapsed().as_secs_f64() * 1000.0;
+                    let restore_started = Instant::now();
+                    if let Ok(child) = restore_golden_vm(&fc_socket, &vm_dir).await {
+                        restore_ms = restore_started.elapsed().as_secs_f64() * 1000.0;
                         firecracker = Some(child);
                         let vsock_conn = format!("{}_52", vsock);
                         let mut guest_socket = loop {
@@ -285,7 +361,10 @@ mod linux_impl {
                                 let _ = socket.write_all(b"CONNECT 52\n").await;
                                 let mut ack = [0_u8; 32];
                                 if let Ok(bytes) = socket.read(&mut ack).await {
-                                    if std::str::from_utf8(&ack[..bytes]).unwrap_or("").starts_with("OK") {
+                                    if std::str::from_utf8(&ack[..bytes])
+                                        .unwrap_or("")
+                                        .starts_with("OK")
+                                    {
                                         break Some(socket);
                                     }
                                 }
@@ -294,6 +373,7 @@ mod linux_impl {
                         };
 
                         if let Some(mut socket) = guest_socket.take() {
+                            let vsock_started = Instant::now();
                             let source_relpath = if capsule.source_relpath.is_empty() {
                                 std::path::Path::new(&capsule.source_path)
                                     .file_name()
@@ -320,31 +400,39 @@ mod linux_impl {
                                 "repo_snapshot": capsule.repo_snapshot
                             })
                             .to_string();
-                            let _ = socket.write_all(payload.as_bytes()).await;
-                            let mut response_buffer = vec![0_u8; 65536];
-                            if let Ok(bytes) = socket.read(&mut response_buffer).await {
-                                if let Ok(parsed) = serde_json::from_slice::<GuestResponse>(&response_buffer[..bytes]) {
-                                    guest_response = parsed;
+                            if write_framed(&mut socket, payload.as_bytes()).await.is_ok() {
+                                if let Ok(response_buffer) =
+                                    read_framed(&mut socket, 1024 * 1024).await
+                                {
+                                    vsock_roundtrip_ms =
+                                        vsock_started.elapsed().as_secs_f64() * 1000.0;
+                                    if let Ok(parsed) =
+                                        serde_json::from_slice::<GuestResponse>(&response_buffer)
+                                    {
+                                        guest_response = parsed;
+                                    }
                                 }
                             }
                         }
                     }
                 }
 
+                let artifact_started = Instant::now();
                 let artifact_uri = persist_artifact(&capsule.id, &capsule, &guest_response);
-                let _ = glommio::spawn_blocking(move || {
-                    if let Some(mut child) = firecracker {
-                        let _ = child.kill();
-                        let _ = child.wait();
-                    }
-                    let _ = std::fs::remove_file(&rootfs);
-                    let _ = std::fs::remove_file(&fc_socket);
-                    let _ = std::fs::remove_file(&format!("{}_52", vsock));
-                })
-                .await;
+                let artifact_write_ms = artifact_started.elapsed().as_secs_f64() * 1000.0;
+                let _ = executor()
+                    .spawn_blocking(move || {
+                        if let Some(mut child) = firecracker {
+                            let _ = child.kill();
+                            let _ = child.wait();
+                        }
+                        let _ = std::fs::remove_dir_all(&vm_dir);
+                    })
+                    .await;
 
                 let mut pack = VerificationPack {
                     capsule_id: capsule.id.clone(),
+                    run_id: capsule.run_id.clone(),
                     success: guest_response.success,
                     runtime: started.elapsed().as_secs_f64(),
                     node_id: format!("core_{core_id}"),
@@ -355,6 +443,20 @@ mod linux_impl {
                     error_signature: guest_response.error.clone(),
                     attestation: None,
                     artifact_uri,
+                    meta: serde_json::json!({
+                        "transport": {
+                            "repo_snapshot_digest": capsule.repo_snapshot_digest,
+                            "repo_snapshot_bytes": capsule.repo_snapshot_bytes,
+                            "repo_snapshot_files": capsule.repo_snapshot_files,
+                        },
+                        "firecracker": {
+                            "clone_ms": clone_ms,
+                            "restore_ms": restore_ms,
+                            "vsock_roundtrip_ms": vsock_roundtrip_ms,
+                            "artifact_write_ms": artifact_write_ms,
+                        },
+                        "funnel": guest_response.meta,
+                    }),
                 };
                 sign_pack(&mut pack, &key);
                 publish_result(redis_for_task, &pack).await;
@@ -364,7 +466,8 @@ mod linux_impl {
     }
 
     pub fn run() {
-        let redis_url = std::env::var("OMEGA_REDIS_URL").unwrap_or_else(|_| "redis://127.0.0.1:6379".to_string());
+        let redis_url = std::env::var("OMEGA_REDIS_URL")
+            .unwrap_or_else(|_| "redis://127.0.0.1:6379".to_string());
         let executor_host =
             std::env::var("OMEGA_EXECUTOR_HOST").unwrap_or_else(|_| "127.0.0.1".to_string());
         let executor_base_port = std::env::var("OMEGA_EXECUTOR_BASE_PORT")
@@ -388,7 +491,7 @@ mod linux_impl {
         let _ = std::fs::create_dir_all(VM_WORKSPACE);
         let mut handles = Vec::new();
         for core_id in 0..num_cores {
-            let key = Rc::new(signing_key.clone());
+            let key = Arc::new(signing_key.clone());
             let redis_for_core = redis_url.clone();
             let host_for_core = executor_host.clone();
             handles.push(std::thread::spawn(move || {

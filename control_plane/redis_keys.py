@@ -1,3 +1,4 @@
+STREAM_DISPATCH = "omega:stream:dispatch"
 STREAM_RESULTS = "omega:stream:results"
 STREAM_ACCEPTED = "omega:stream:accepted"
 TREE_INDEX = "omega:trees"
@@ -30,3 +31,11 @@ def tree_done_key(task_id: str) -> str:
 
 def tree_accepted_key(task_id: str) -> str:
     return f"omega:tree:{task_id}:accepted"
+
+
+def task_budget_key(task_id: str) -> str:
+    return f"omega:tree:{task_id}:generated_capsules"
+
+
+def tree_budget_exhausted_key(task_id: str) -> str:
+    return f"omega:tree:{task_id}:budget_exhausted"

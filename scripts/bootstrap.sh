@@ -6,6 +6,13 @@ if [[ "$(uname -s)" != "Linux" ]]; then
   exit 1
 fi
 
+require_cmd() {
+  if ! command -v "$1" >/dev/null 2>&1; then
+    echo "Missing required command: $1"
+    exit 1
+  fi
+}
+
 HOST_ARCH="$(uname -m)"
 case "$HOST_ARCH" in
   x86_64)
@@ -26,6 +33,27 @@ if ! grep -Eq 'Ubuntu|Debian' /etc/os-release; then
   echo "Kernel Omega expects Ubuntu 22.04+ or Debian 12."
   exit 1
 fi
+
+if [[ ! -e /dev/kvm ]]; then
+  echo "/dev/kvm is missing. Firecracker requires KVM."
+  exit 1
+fi
+
+if [[ ! -r /dev/kvm || ! -w /dev/kvm ]]; then
+  echo "Current user does not have read/write access to /dev/kvm."
+  exit 1
+fi
+
+require_cmd sudo
+require_cmd wget
+require_cmd tar
+require_cmd dd
+require_cmd mkfs.ext4
+require_cmd mount
+require_cmd mountpoint
+require_cmd umount
+require_cmd prlimit
+require_cmd chroot
 
 if ! command -v firecracker >/dev/null 2>&1; then
   echo "Firecracker not found; it will be installed into /usr/local/bin."
@@ -53,6 +81,7 @@ sudo prlimit --memlock=unlimited --pid $$
 mkdir -p /tmp/omega/assets /tmp/omega/vms /tmp/omega/mnt
 
 if ! df -T /tmp/omega 2>/dev/null | grep -q -e "btrfs" -e "xfs"; then
+  require_cmd mkfs.btrfs
   echo "[*] Creating Btrfs loopback for FICLONE..."
   dd if=/dev/zero of=/tmp/omega_storage.img bs=1M count=4096 status=none
   mkfs.btrfs -q /tmp/omega_storage.img
@@ -68,6 +97,12 @@ dd if=/dev/zero of=/tmp/omega/assets/rootfs.ext4 bs=1M count=150 status=none
 mkfs.ext4 -q /tmp/omega/assets/rootfs.ext4
 wget -q "$ALPINE_URL" -O /tmp/alpine.tar.gz
 sudo mount /tmp/omega/assets/rootfs.ext4 /tmp/omega/mnt
+cleanup_mount() {
+  if mountpoint -q /tmp/omega/mnt; then
+    sudo umount /tmp/omega/mnt
+  fi
+}
+trap cleanup_mount EXIT
 sudo tar -xf /tmp/alpine.tar.gz -C /tmp/omega/mnt
 sudo cp /etc/resolv.conf /tmp/omega/mnt/etc/resolv.conf
 sudo chroot /tmp/omega/mnt /sbin/apk update
@@ -75,7 +110,8 @@ sudo chroot /tmp/omega/mnt /sbin/apk add --no-cache python3 py3-pip py3-pytest p
 sudo cp "guest_agent/target/${GUEST_TARGET}/release/guest_agent" /tmp/omega/mnt/sbin/init
 sudo cp guest_agent/funnel.py /tmp/omega/mnt/sbin/funnel.py
 sudo chmod +x /tmp/omega/mnt/sbin/init /tmp/omega/mnt/sbin/funnel.py
-sudo umount /tmp/omega/mnt
+cleanup_mount
+trap - EXIT
 
 echo "[*] Installing Firecracker guest kernel and binary..."
 wget -q "$KERNEL_URL" -O /tmp/omega/assets/vmlinux.bin

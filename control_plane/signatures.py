@@ -16,6 +16,7 @@ def canonical_signature_bytes(pack: VerificationPack) -> bytes:
         "error_signature": pack.error_signature,
         "hardware_isolated": pack.hardware_isolated,
         "inputs_digest": pack.inputs_digest,
+        "run_id": pack.run_id,
         "success": pack.success,
         "tests_failed": pack.tests_failed,
         "tests_passed": pack.tests_passed,

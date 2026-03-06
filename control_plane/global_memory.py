@@ -4,6 +4,7 @@ import json
 import time
 
 from control_plane.contracts import VerificationPack
+from control_plane.metadata_store import MetadataStore
 from control_plane.redis_keys import (
     RECENT_RUNS,
     STATS_EVAL_TIMES,
@@ -18,6 +19,7 @@ from control_plane.runtime import build_parser, ensure_stream_group, load_runtim
 class GlobalMemory:
     def __init__(self, profile: str) -> None:
         self.config, self.redis = load_runtime(profile)
+        self.metadata = MetadataStore(self.config)
         ensure_stream_group(self.redis, STREAM_RESULTS, "memory_group")
 
     def compute_reward(self, pack: VerificationPack, parent_data: dict[str, str] | None) -> float:
@@ -46,6 +48,7 @@ class GlobalMemory:
                 for message_id, message in messages:
                     try:
                         pack = VerificationPack.from_json(message["payload"])
+                        self.metadata.complete_execution(pack)
                         node_data = self.redis.hgetall(pack.capsule_id)
                         if not node_data:
                             continue
@@ -96,6 +99,10 @@ class GlobalMemory:
                         if pack.success and pack.tests_failed == 0:
                             pipe.set(tree_done_key(task_id), pack.capsule_id)
                             pipe.hset(pack.capsule_id, "is_terminal", "True")
+                            self.metadata.update_candidate_status(pack.capsule_id, "verified")
+                            self.metadata.update_task_status(task_id, "verified")
+                        else:
+                            self.metadata.update_candidate_status(pack.capsule_id, "failed")
                     finally:
                         pipe.xack(STREAM_RESULTS, "memory_group", message_id)
                 pipe.execute()
@@ -109,4 +116,3 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
-

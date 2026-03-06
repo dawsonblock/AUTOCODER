@@ -2,6 +2,9 @@
 language = "python"
 package_manager = "pip"
 
+[metadata]
+postgres_url = "postgresql://postgres:postgres@127.0.0.1:5432/omega"
+
 [omega]
 redis = "redis://127.0.0.1:6379"
 cas_endpoint = "http://127.0.0.1:9000"

@@ -16,9 +16,9 @@
 
 | Capability | Detail |
 |---|---|
-| **MCTS Search** | Monte-Carlo Tree Search over AST mutations with UCB1 selection |
+| **Tree Search** | Redis-backed UCB tree search over deterministic candidate mutations |
 | **Z3 SMT Oracle** | Prunes semantically-equivalent candidates before execution |
-| **Tree-sitter Patching** | Targeted, syntax-aware comparison-operator mutations |
+| **AST Patching** | Targeted, syntax-aware comparison-operator mutations |
 | **Fault Localization** | Spectrum-based suspicious-line ranking from coverage matrices |
 | **Hardware Isolation** | Firecracker micro-VMs via Rust hypervisor on Linux KVM |
 | **Cryptographic Signing** | Ed25519 patch signatures with policy-gate verification |
@@ -37,14 +37,15 @@
                   │                    │                         │
                   │            ┌───────┴────────┐               │
                   │            ▼                ▼               │
-                  │      Forest Worker    Policy Gate            │
-                  │      (MCTS + Z3)     (deny rules)           │
+                  │      Forest Worker       Policy Gate         │
+                  │   (UCB + Z3 prune)      (deny rules)        │
                   │            │                │               │
                   │            ▼                ▼               │
-                  │        Merger ◀──── Signature Verify         │
+                  │       Dispatcher      Merger ◀─ Signature   │
+                  │            │                                 │
                   │            │                                │
                   └────────────┼────────────────────────────────┘
-                               │  TaskCapsule (TCP)
+                               │  TaskCapsule via Redis stream + TCP
                   ┌────────────▼────────────────────────────────┐
                   │         DATA  PLANE  (Rust / Firecracker)   │
                   │                                              │
@@ -64,13 +65,16 @@
 .
 ├── control_plane/           # Python search & orchestration
 │   ├── omega_cli.py         #   CLI entry-point (omega fix)
-│   ├── forest_worker.py     #   MCTS expand / select loop
+│   ├── forest_worker.py     #   UCB search / expansion loop
+│   ├── dispatcher.py        #   Dispatch queue -> executor sockets
+│   ├── planning.py          #   Task planning & expansion policy
 │   ├── smt_oracle.py        #   Z3 equivalence checker
-│   ├── tree_sitter_engine.py#   AST-level targeted patching
+│   ├── tree_sitter_engine.py#   Python AST-level targeted patching
 │   ├── coverage_analysis.py #   Spectrum-based fault localization
 │   ├── policy_gate.py       #   Security & diff-budget rules
 │   ├── merger.py            #   Auto-merge verified patches
 │   ├── global_memory.py     #   Redis-backed shared state
+│   ├── metadata_store.py    #   Postgres task/candidate/run ledger
 │   ├── simulator_executor.py#   macOS dev-mode executor
 │   ├── telemetry_api.py     #   REST API for the dashboard
 │   └── signatures.py        #   Ed25519 sign / verify
@@ -85,7 +89,7 @@
 ├── scripts/                 # Bootstrap, snapshot, start/stop
 ├── telemetry/               # bpftrace kernel-level tracing
 ├── tests/                   # Unit + integration test suite
-├── docs/                    # Additional guides (UTM setup)
+├── docs/                    # Additional guides (UTM setup, Linux bring-up)
 └── KERNEL/                  # Design documents & specs
 ```
 
@@ -109,20 +113,24 @@ python3 -m venv .venv && source .venv/bin/activate
 pip install -r requirements.txt
 
 # Spin up infra
-docker compose up -d            # Redis 7 + MinIO
+docker compose up -d            # Redis + MinIO + Postgres
+
+# If local port 5432 is already taken:
+# OMEGA_POSTGRES_PORT=5433 docker compose up -d
 
 # Launch the executor (simulator mode)
-python -m control_plane.simulator_executor --profile dev-macos
+.venv/bin/python -m control_plane.simulator_executor --profile dev-macos
 # Copy the printed public key → OMEGA_TRUSTED_PUBKEY
 
 # Launch the control-plane daemons
-python -m control_plane.global_memory   --profile dev-macos
-python -m control_plane.policy_gate     --profile dev-macos
-python -m control_plane.merger          --profile dev-macos
-python -m control_plane.forest_worker   --profile dev-macos
+.venv/bin/python -m control_plane.global_memory   --profile dev-macos
+.venv/bin/python -m control_plane.policy_gate     --profile dev-macos
+.venv/bin/python -m control_plane.merger          --profile dev-macos
+.venv/bin/python -m control_plane.dispatcher      --profile dev-macos
+.venv/bin/python -m control_plane.forest_worker   --profile dev-macos
 
 # Seed a repair task
-python -m control_plane.omega_cli fix \
+.venv/bin/python -m control_plane.omega_cli fix \
   tests/fixtures/sample_repo/src/algo.py \
   tests/fixtures/sample_repo/tests/test_algo.py \
   --profile dev-macos
@@ -147,6 +155,9 @@ cd omega_hypervisor && cargo run --release
 # Then start the Python daemons with --profile linux-prod
 ```
 
+Before the first real Linux run, use the bring-up runbook:
+- [docs/linux-firecracker-bringup.md](/Users/dawsonblock/SANDBOX/THEAUTOCODER/docs/linux-firecracker-bringup.md)
+
 ---
 
 ## 🔀 Split-Brain Deployment
@@ -162,16 +173,19 @@ cd omega_hypervisor && cargo run --release
 # Linux host
 docker compose up -d
 ./scripts/bootstrap.sh && ./scripts/build_golden_snapshot.sh
-./scripts/start_linux_executor.sh --env-file config/env/linux-executor.env
+./scripts/start_linux_executor.sh --env-file config/env/linux-executor.example.env
 
 # macOS host
 ./scripts/start_control_plane.sh \
-  --env-file config/env/split-brain-mac.env \
+  --env-file config/env/split-brain-mac.example.env \
   --profile split-brain-mac \
   --workers 2
 ```
 
 See [config/env/](config/env/) for env-file templates.
+
+For Linux host validation and expected Firecracker log signatures, see:
+- [docs/linux-firecracker-bringup.md](/Users/dawsonblock/SANDBOX/THEAUTOCODER/docs/linux-firecracker-bringup.md)
 
 ---
 
@@ -181,13 +195,14 @@ All settings live in **TOML** files under `config/`.
 
 | Key | Default | Description |
 |---|---|---|
-| `budgets.max_capsules` | `200` | Total candidate budget per task |
+| `budgets.max_capsules` | `200` | Enforced total candidate budget per task |
 | `budgets.max_depth` | `6` | Max MCTS tree depth |
 | `budgets.max_children` | `4` | Candidates generated per expansion |
 | `budgets.max_diff_lines` | `10` | Max diff size the merger will accept |
 | `policy.deny_edit_tests` | `true` | Block patches that modify test files |
 | `policy.deny_disable_asserts` | `true` | Block patches that weaken assertions |
 | `policy.require_hardware_isolation` | `true` | Enforce Firecracker execution |
+| `metadata.postgres_url` | `postgresql://postgres:postgres@127.0.0.1:5432/omega` | Durable task/candidate/run metadata |
 
 Override any value via profile-specific files (e.g. `dev-macos.toml`).
 
@@ -206,6 +221,21 @@ pytest --cov=control_plane --cov-report=term-missing
 mypy control_plane/
 ruff check .
 ```
+
+## 📈 Optimization Audit
+
+```bash
+# Runs the measured v1 audit against the sample and medium fixtures.
+# The runner will use a dedicated Postgres host port automatically if 5432 is busy.
+.venv/bin/python scripts/run_optimization_audit.py
+
+# Override the audit database port explicitly if needed
+OMEGA_AUDIT_POSTGRES_PORT=5434 .venv/bin/python scripts/run_optimization_audit.py
+```
+
+Outputs:
+- [tmp/optimization-audit/optimization_audit_report.md](/Users/dawsonblock/SANDBOX/THEAUTOCODER/tmp/optimization-audit/optimization_audit_report.md)
+- [tmp/optimization-audit/optimization_audit_report.json](/Users/dawsonblock/SANDBOX/THEAUTOCODER/tmp/optimization-audit/optimization_audit_report.json)
 
 ---
 
@@ -226,6 +256,7 @@ ruff check .
 ## 📜 Notes
 
 - V1 repairs a single Python source file at a time, targeting comparison-operator bugs.
+- The current control plane uses Redis for hot scheduling state and Postgres for durable task, candidate, execution, and policy metadata.
 - Full security guarantees (cryptographic attestation, hardware isolation) only apply to the **linux-prod** profile.
 - LLM-guided repair orchestration (Phase 5) is intentionally deferred.
 - ARM64 Firecracker support is available but less proven than x86_64 or the split-brain path.

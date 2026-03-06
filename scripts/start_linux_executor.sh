@@ -40,6 +40,19 @@ PUBKEY_FILE="${PUBKEY_FILE_ARG:-${OMEGA_PUBKEY_FILE:-$HOME/.config/kernel-omega/
 mkdir -p "$LOG_DIR" "$(dirname "$PUBKEY_FILE")"
 LOG_FILE="$LOG_DIR/omega_hypervisor.log"
 
+if ! command -v cargo >/dev/null 2>&1; then
+  echo "cargo is required to run the Linux executor." >&2
+  exit 1
+fi
+
+for asset in /tmp/omega/assets/golden-template/rootfs.ext4 /tmp/omega/assets/vm.snap /tmp/omega/assets/vm.mem /tmp/omega/assets/vmlinux.bin; do
+  if [[ ! -f "$asset" ]]; then
+    echo "Missing required asset: $asset" >&2
+    echo "Run ./scripts/bootstrap.sh and ./scripts/build_golden_snapshot.sh first." >&2
+    exit 1
+  fi
+done
+
 cd "$ROOT_DIR/omega_hypervisor"
 cargo run --release 2>&1 | while IFS= read -r line; do
   printf '%s\n' "$line" | tee -a "$LOG_FILE"

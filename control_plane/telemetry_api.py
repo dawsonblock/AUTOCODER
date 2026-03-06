@@ -4,6 +4,7 @@ import json
 import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
+from control_plane.metadata_store import MetadataStore
 from control_plane.redis_keys import (
     RECENT_RUNS,
     STATS_EVAL_TIMES,
@@ -19,6 +20,7 @@ from control_plane.runtime import build_parser, load_runtime
 class TelemetryAPI:
     def __init__(self, profile: str) -> None:
         self.config, self.redis = load_runtime(profile)
+        self.metadata = MetadataStore(self.config)
 
     def dashboard_payload(self) -> dict[str, object]:
         now = time.time()
@@ -34,8 +36,9 @@ class TelemetryAPI:
             forest_state.append(
                 {
                     "id": task_id,
-                    "strategy": "TREE_SITTER + Z3_SMT",
+                    "strategy": root.get("plan_summary", "Legacy plan"),
                     "depth": int(root.get("max_depth_seen", 0)),
+                    "generated_capsules": int(root.get("generated_capsules", 0)),
                     "best_reward": float(root.get("best_reward", 0.0)),
                 }
             )
@@ -47,6 +50,7 @@ class TelemetryAPI:
                 "totalEvals": int(self.redis.get(STATS_TOTAL_EVALS) or 0),
                 "evalsPerSec": float(self.redis.zcount(STATS_EVAL_TIMES, now - 5, "+inf")) / 5.0,
             },
+            "performance": self.metadata.performance_snapshot(),
             "liveRuns": live_runs,
             "forestState": forest_state,
         }
